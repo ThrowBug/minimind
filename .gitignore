@@ -9,3 +9,4 @@ docs-minimind/
 checkpoints/
 dataset/*.jsonl
 minimind-3/
+train_script.sh
