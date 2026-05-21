@@ -4,3 +4,8 @@ __pycache__/
 out
 website/
 docs-minimind/
+.vscode/
+笔记/
+checkpoints/
+dataset/*.jsonl
+minimind-3/
