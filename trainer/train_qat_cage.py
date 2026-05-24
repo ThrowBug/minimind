@@ -24,6 +24,9 @@ warnings.filterwarnings('ignore')
 # Global variable to track whether QAT is currently active
 qat_active = None
 
+# Global variable to track learning rate ratios for Muon optimizer
+lr_ratios = None
+
 
 # ========== QAT Quantization Operators and Utilities ==========
 
@@ -65,6 +68,11 @@ class QuantLinear(nn.Linear):
         self.bits = bits
         self.quant_act = quant_act
         self.quant_enabled = False
+        
+        # Define and bind CAGE-compatible quantizer
+        def quantizer_fn(w):
+            return quantize_symmetric(w, bits=self.bits)
+        setattr(self.weight, "quantizer", quantizer_fn)
 
     def forward(self, input):
         if not self.quant_enabled:
@@ -99,6 +107,12 @@ def replace_linear_with_quant(model, bits=8, quant_act=False):
             )
             # Preserve original parameter references
             quant_linear.weight = child.weight
+            
+            # Rebind CAGE quantizer on the preserved weight reference
+            def quantizer_fn(w):
+                return quantize_symmetric(w, bits=bits)
+            setattr(quant_linear.weight, "quantizer", quantizer_fn)
+            
             if has_bias:
                 quant_linear.bias = child.bias
             
@@ -120,7 +134,7 @@ def set_quant_enabled(model, enabled=True):
 
 # ========== Pretraining Epoch Function ==========
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(epoch, loader, iters, start_step=0, wandb=None, cage=None):
     start_time = time.time()
     last_step = start_step
     grad_norm = 0.0
@@ -130,8 +144,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         labels = labels.to(args.device)
         last_step = step
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        if args.optimizer == 'muon' and lr_ratios is not None:
+            for param_group, ratio in zip(optimizer.param_groups, lr_ratios):
+                param_group['lr'] = lr * ratio
+        else:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
 
         # --- QAT Stage Checking ---
         current_step = epoch * iters + step
@@ -161,6 +179,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             scaler.step(optimizer)
             scaler.update()
 
+            # Optional CAGE post-step correction using current LR after optimizer update
+            if args.use_cage and cage is not None and qat_active:
+                cage.step()
+
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters:
@@ -170,9 +192,19 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, grad_norm: {grad_norm:.4f}, qat: {qat_active}, epoch_time: {eta_min:.1f}min')
+            
+            # Gather CAGE stats if active
+            cage_log_str = ""
+            cage_stats = {}
+            if args.use_cage and cage is not None and qat_active:
+                stats = cage.get_stats()
+                if stats:
+                    cage_log_str = f", cage_lam: {stats.get('lambda', 0.0):.4f}, cage_err: {stats.get('avg_err_norm', 0.0):.4f}"
+                    cage_stats = {f"cage_{k}": v for k, v in stats.items()}
+
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, grad_norm: {grad_norm:.4f}, qat: {qat_active}{cage_log_str}, epoch_time: {eta_min:.1f}min')
             if wandb: 
-                wandb.log({
+                log_data = {
                     "loss": current_loss, 
                     "logits_loss": current_logits_loss, 
                     "aux_loss": current_aux_loss, 
@@ -180,7 +212,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     "grad_norm": grad_norm,
                     "qat_enabled": 1 if qat_active else 0,
                     "epoch_time": eta_min
-                })
+                }
+                log_data.update(cage_stats)
+                wandb.log(log_data)
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
@@ -202,6 +236,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         grad_norm = grad_norm_tensor.item() if isinstance(grad_norm_tensor, torch.Tensor) else float(grad_norm_tensor)
         scaler.step(optimizer)
         scaler.update()
+
+        # Optional CAGE post-step correction in remaining accumulation steps
+        if args.use_cage and cage is not None and qat_active:
+            cage.step()
+
         optimizer.zero_grad(set_to_none=True)
 
 
@@ -235,6 +274,15 @@ if __name__ == "__main__":
     parser.add_argument("--quant_act", type=int, default=0, choices=[0, 1], help="是否量化activation（0=否，1=是）")
     parser.add_argument("--quant_bits", type=int, default=8, help="量化位数")
     
+    # CAGE Specific Arguments
+    parser.add_argument("--use_cage", action="store_true", help="是否使用CAGE后修正")
+    parser.add_argument("--cage_lambda", type=float, default=10.0, help="CAGE纠偏拉格朗日基准强度")
+    parser.add_argument("--cage_silence_ratio", type=float, default=0.8, help="CAGE在整个QAT阶段中的静默比例")
+    parser.add_argument("--cage_schedule", type=str, default="linear_ramp", choices=["linear_ramp", "constant"], help="CAGE纠偏强度的调度策略")
+    
+    # Optimizer Choice Argument
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"], help="选择优化器（adamw 或 muon）")
+    
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -258,7 +306,8 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-QAT-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        cage_suffix = f"-cage-lam{args.cage_lambda}" if args.use_cage else "-no_cage"
+        wandb_run_name = f"MiniMind-QAT-Pretrain-{args.quant_bits}bit-{args.optimizer}-lr{args.learning_rate}-epoch{args.epochs}-bs{args.batch_size}{cage_suffix}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
@@ -272,7 +321,83 @@ if __name__ == "__main__":
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    
+    if args.optimizer == 'muon':
+        from optimizer.Muon.muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
+        
+        seen_ids = set()
+        hidden_matrix_params = []
+        embed_params = []
+        head_params = []
+        scalar_params = []
+        
+        # We group parameters, filtering out duplicate references (e.g. tied weights)
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if id(p) in seen_ids:
+                continue
+            seen_ids.add(id(p))
+            
+            if p.ndim < 2:
+                scalar_params.append(p)
+            elif "embed" in name:
+                embed_params.append(p)
+            elif "lm_head" in name:
+                head_params.append(p)
+            else:
+                hidden_matrix_params.append(p)
+        
+        param_groups = []
+        lr_ratios = []
+        
+        if len(head_params) > 0:
+            param_groups.append({
+                "params": head_params,
+                "lr": args.learning_rate * 4.4,
+                "betas": (0.9, 0.95),
+                "eps": 1e-10,
+                "weight_decay": 0.01,
+                "use_muon": False
+            })
+            lr_ratios.append(4.4)
+            
+        if len(embed_params) > 0:
+            param_groups.append({
+                "params": embed_params,
+                "lr": args.learning_rate * 12.0,
+                "betas": (0.9, 0.95),
+                "eps": 1e-10,
+                "weight_decay": 0.01,
+                "use_muon": False
+            })
+            lr_ratios.append(12.0)
+            
+        if len(scalar_params) > 0:
+            param_groups.append({
+                "params": scalar_params,
+                "lr": args.learning_rate * 0.8,
+                "betas": (0.9, 0.95),
+                "eps": 1e-10,
+                "weight_decay": 0.01,
+                "use_muon": False
+            })
+            lr_ratios.append(0.8)
+            
+        if len(hidden_matrix_params) > 0:
+            param_groups.append({
+                "params": hidden_matrix_params,
+                "lr": args.learning_rate,
+                "momentum": 0.95,
+                "weight_decay": 0.0,
+                "use_muon": True
+            })
+            lr_ratios.append(1.0)
+            
+        opt_class = MuonWithAuxAdam if dist.is_initialized() else SingleDeviceMuonWithAuxAdam
+        optimizer = opt_class(param_groups)
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
@@ -282,6 +407,36 @@ if __name__ == "__main__":
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
+    
+    # ========== 6.5. CAGE 初始化 ==========
+    cage = None
+    if args.use_cage:
+        from CAGE.cage import CAGE
+        import math
+        if dist.is_initialized():
+            num_samples = math.ceil(len(train_ds) / dist.get_world_size())
+            epoch_iters = math.ceil(num_samples / args.batch_size)
+        else:
+            epoch_iters = math.ceil(len(train_ds) / args.batch_size)
+            
+        total_steps = args.epochs * epoch_iters
+        qat_start_step = int(total_steps * args.qat_stage)
+        qat_steps = total_steps - qat_start_step
+        
+        if qat_steps > 0:
+            cage = CAGE(
+                optimizers=[optimizer],
+                lambda_base=args.cage_lambda,
+                total_steps=qat_steps,
+                silence_ratio=args.cage_silence_ratio,
+                schedule=args.cage_schedule,
+                track_stats=True
+            )
+            # If resuming from checkpoint, align the CAGE step counter
+            current_step = start_epoch * epoch_iters + start_step
+            elapsed_qat_steps = max(0, current_step - qat_start_step)
+            cage._step = elapsed_qat_steps
+            Logger(f"--- CAGE initialized: total QAT steps = {qat_steps}, resumed step = {cage._step} ---")
     
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
@@ -299,9 +454,9 @@ if __name__ == "__main__":
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb, cage)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, len(loader), 0, wandb, cage)
     
     # ========== 9. 清理分布进程 ==========
     if dist.is_initialized(): dist.destroy_process_group()

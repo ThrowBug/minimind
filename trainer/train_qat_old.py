@@ -24,9 +24,6 @@ warnings.filterwarnings('ignore')
 # Global variable to track whether QAT is currently active
 qat_active = None
 
-# Global variable to track learning rate ratios for Muon optimizer
-lr_ratios = None
-
 
 # ========== QAT Quantization Operators and Utilities ==========
 
@@ -133,12 +130,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         labels = labels.to(args.device)
         last_step = step
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-        if args.optimizer == 'muon' and lr_ratios is not None:
-            for param_group, ratio in zip(optimizer.param_groups, lr_ratios):
-                param_group['lr'] = lr * ratio
-        else:
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
         # --- QAT Stage Checking ---
         current_step = epoch * iters + step
@@ -242,9 +235,6 @@ if __name__ == "__main__":
     parser.add_argument("--quant_act", type=int, default=0, choices=[0, 1], help="是否量化activation（0=否，1=是）")
     parser.add_argument("--quant_bits", type=int, default=8, help="量化位数")
     
-    # Optimizer Choice Argument
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"], help="选择优化器（adamw 或 muon）")
-    
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -282,83 +272,7 @@ if __name__ == "__main__":
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
-    
-    if args.optimizer == 'muon':
-        from optimizer.Muon.muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
-        
-        seen_ids = set()
-        hidden_matrix_params = []
-        embed_params = []
-        head_params = []
-        scalar_params = []
-        
-        # We group parameters, filtering out duplicate references (e.g. tied weights)
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if id(p) in seen_ids:
-                continue
-            seen_ids.add(id(p))
-            
-            if p.ndim < 2:
-                scalar_params.append(p)
-            elif "embed" in name:
-                embed_params.append(p)
-            elif "lm_head" in name:
-                head_params.append(p)
-            else:
-                hidden_matrix_params.append(p)
-        
-        param_groups = []
-        lr_ratios = []
-        
-        if len(head_params) > 0:
-            param_groups.append({
-                "params": head_params,
-                "lr": args.learning_rate * 4.4,
-                "betas": (0.9, 0.95),
-                "eps": 1e-10,
-                "weight_decay": 0.01,
-                "use_muon": False
-            })
-            lr_ratios.append(4.4)
-            
-        if len(embed_params) > 0:
-            param_groups.append({
-                "params": embed_params,
-                "lr": args.learning_rate * 12.0,
-                "betas": (0.9, 0.95),
-                "eps": 1e-10,
-                "weight_decay": 0.01,
-                "use_muon": False
-            })
-            lr_ratios.append(12.0)
-            
-        if len(scalar_params) > 0:
-            param_groups.append({
-                "params": scalar_params,
-                "lr": args.learning_rate * 0.8,
-                "betas": (0.9, 0.95),
-                "eps": 1e-10,
-                "weight_decay": 0.01,
-                "use_muon": False
-            })
-            lr_ratios.append(0.8)
-            
-        if len(hidden_matrix_params) > 0:
-            param_groups.append({
-                "params": hidden_matrix_params,
-                "lr": args.learning_rate,
-                "momentum": 0.95,
-                "weight_decay": 0.0,
-                "use_muon": True
-            })
-            lr_ratios.append(1.0)
-            
-        opt_class = MuonWithAuxAdam if dist.is_initialized() else SingleDeviceMuonWithAuxAdam
-        optimizer = opt_class(param_groups)
-    else:
-        optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
