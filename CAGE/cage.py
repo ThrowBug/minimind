@@ -4,8 +4,6 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from torch.optim.optimizer import _get_value
-
 
 class CAGE:
     """
@@ -83,7 +81,12 @@ class CAGE:
             self._stats["lambda"] = lam
         for opt in self.optimizers:
             for group in opt.param_groups:
-                lr = _get_value(group.get("lr", None))
+                lr = group.get("lr", None)
+                if lr is None:
+                    continue
+                if hasattr(lr, "item"):
+                    lr = lr.item()
+                lr = float(lr)
                 for p in group["params"]:
                     q = self._default_quantizer(p)
                     if q is None:
