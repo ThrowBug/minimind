@@ -8,6 +8,8 @@ docs-minimind/
 笔记/
 checkpoints/
 dataset/*.jsonl
+dataset/*.txt
 minimind-3/
 train_qat.sh
 .gitignore
+test_PPL.sh

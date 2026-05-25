@@ -5,6 +5,10 @@ import numpy as np
 import torch
 import math
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from model.model_lora import *
 
