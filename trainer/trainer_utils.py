@@ -61,6 +61,7 @@ def setup_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+    save_dir = os.path.abspath(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
@@ -72,8 +73,19 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         state_dict = raw_model.state_dict()
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
         ckp_tmp = ckp_path + '.tmp'
+        
+        # 写入临时文件并替换，防止写入中断损坏已有权重
         torch.save(state_dict, ckp_tmp)
-        os.replace(ckp_tmp, ckp_path)
+        try:
+            os.replace(ckp_tmp, ckp_path)
+        except (FileNotFoundError, PermissionError):
+            import time
+            time.sleep(0.2)  # 针对网络共享挂载、WSL或虚拟机同步延迟，等待后重试
+            try:
+                os.replace(ckp_tmp, ckp_path)
+            except Exception:
+                torch.save(state_dict, ckp_path)  # 最终兜底：直接写入目标文件
+                
         wandb_id = None
         if wandb:
             if hasattr(wandb, 'get_run'):
@@ -101,7 +113,16 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
         resume_tmp = resume_path + '.tmp'
         torch.save(resume_data, resume_tmp)
-        os.replace(resume_tmp, resume_path)
+        try:
+            os.replace(resume_tmp, resume_path)
+        except (FileNotFoundError, PermissionError):
+            import time
+            time.sleep(0.2)
+            try:
+                os.replace(resume_tmp, resume_path)
+            except Exception:
+                torch.save(resume_data, resume_path)
+                
         del state_dict, resume_data
         torch.cuda.empty_cache()
     else:  # 加载模式
